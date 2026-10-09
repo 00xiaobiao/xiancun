@@ -1,0 +1,575 @@
+#!/usr/bin/python3
+"""空闲 GPU 自动计算；监督进程不依赖 CUDA/PyTorch 初始化。"""
+import argparse
+import contextlib
+import csv
+import ctypes
+import fcntl
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+import math
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+SELF = Path(__file__).resolve()
+STATE = Path(os.environ.get("XIANCUN_STATE_DIR", str(Path.home() / ".cache/xiancun")))
+SUPERVISORD = "/etc/aibox/bin/supervisord"
+SUPERVISORCTL = "/etc/aibox/bin/supervisorctl"
+DEFAULTS = {
+    "memory_gib": 5.0, "rotation_hours": 24.0,
+    "interval": 30.0, "idle_seconds": 30.0, "gpu_count": 2,
+    "util_threshold": 0, "heartbeat_timeout": 120.0,
+    "python": str(Path.home() / "miniforge/envs/gpu-keepalive/bin/python"),
+}
+LOG = logging.getLogger("xiancun")
+
+
+def atomic_json(path, value):
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        return default
+
+
+@contextlib.contextmanager
+def lock(name, blocking=True):
+    STATE.mkdir(parents=True, exist_ok=True)
+    with (STATE / name).open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        yield
+
+
+def process_identity(pid):
+    """PID 加启动时间，避免 PID 复用时误杀其他任务；僵尸进程不算存活。"""
+    try:
+        fields = Path(f"/proc/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()
+        return None if fields[0] == "Z" else fields[19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def is_our_worker(record):
+    pid = record["pid"]
+    if not record.get("identity") or process_identity(pid) != record["identity"]:
+        return False
+    try:
+        env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        return b"XIANCUN_ROLE=worker" in env and f"XIANCUN_STATE_DIR={STATE}".encode() in env
+    except OSError:
+        return False
+
+
+def terminate_workers(records):
+    """只处理本脚本创建且身份匹配的进程，同时发信号，最多等待 5 秒。"""
+    live = [record for record in records if is_our_worker(record)]
+    for record in live:
+        try:
+            os.kill(record["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and any(is_our_worker(r) for r in live):
+        time.sleep(0.1)
+    for record in live:
+        if is_our_worker(record):
+            try:
+                os.kill(record["pid"], signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def smi_rows(query):
+    result = subprocess.run(
+        ["nvidia-smi", query, "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, timeout=10, check=True,
+    )
+    return [list(map(str.strip, row)) for row in csv.reader(result.stdout.splitlines()) if row]
+
+
+def snapshot():
+    gpus = []
+    for row in smi_rows("--query-gpu=index,uuid,utilization.gpu,memory.free"):
+        index, uuid, utilization, free = row
+        gpus.append({"index": int(index), "uuid": uuid, "util": int(utilization), "free": int(free)})
+    if not gpus:
+        raise RuntimeError("没有检测到 GPU")
+    apps = [{"uuid": uuid, "pid": int(pid)}
+            for uuid, pid in smi_rows("--query-compute-apps=gpu_uuid,pid")]
+    return sorted(gpus, key=lambda g: g["index"]), apps
+
+
+class UnclearUtilization(RuntimeError):
+    """存在共享 GPU，但驱动没有提供可用的逐进程利用率。"""
+
+
+def process_utilization():
+    result = subprocess.run(["nvidia-smi", "pmon", "-c", "1", "-s", "u"],
+                            capture_output=True, text=True, timeout=10, check=True)
+    usage = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if not fields or fields[0].startswith("#"):
+            continue
+        if len(fields) < 4 or not fields[0].isdigit() or not fields[1].isdigit():
+            continue
+        # pmon 的 '-' 表示没有有效读数，不能擅自当作 0%。
+        usage[(int(fields[0]), int(fields[1]))] = int(fields[3]) if fields[3].isdigit() else None
+    return usage
+
+
+def gpu_busy_reasons(gpus, apps, workers, threshold, usage=None):
+    occupied = {int(gpu) for gpu in workers}
+    reasons = {g["index"]: f"GPU {g['index']} 外部利用率 {g['util']}%"
+               for g in gpus if g["index"] not in occupied and g["util"] > threshold}
+    own_pids = {record["pid"] for record in workers.values()}
+    by_uuid = {gpu["uuid"]: gpu for gpu in gpus}
+    shared = []
+    for app in apps:
+        gpu = by_uuid.get(app["uuid"])
+        if (gpu is not None and gpu["index"] in occupied and app["pid"] not in own_pids
+                and gpu["util"] > threshold):
+            shared.append((gpu["index"], app["pid"]))
+    if not shared:
+        return reasons
+    if usage is None:
+        try:
+            usage = process_utilization()
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            raise UnclearUtilization(str(error)) from error
+    for (gpu, pid), value in usage.items():
+        if gpu in occupied and pid not in own_pids and value is not None and value > threshold:
+            reasons[gpu] = f"GPU {gpu} 其他进程正在计算：PID={pid}，利用率 {value}%"
+    if any(gpu not in reasons and usage.get((gpu, pid)) is None for gpu, pid in shared):
+        raise UnclearUtilization("共享 GPU 的逐进程利用率暂不可用")
+    return reasons
+
+
+def busy_reason(gpus, apps, workers, threshold, usage=None):
+    return "; ".join(gpu_busy_reasons(gpus, apps, workers, threshold, usage).values()) or None
+
+
+def unmasked_snapshot(workers):
+    """逐卡测量自己的负载被排除后的利用率，其余卡保持计算。"""
+    gpus, apps = snapshot()
+    measured = {gpu["index"]: gpu for gpu in gpus}
+    own_indices = {int(gpu) for gpu in workers}
+    for index, record in workers.items():
+        if is_our_worker(record):
+            try:
+                os.kill(record["pid"], signal.SIGSTOP)
+                # 排空单次矩阵乘法并越过采样窗口；同一时刻只暂停一张卡。
+                time.sleep(2)
+                sample, apps = snapshot()
+                for gpu in sample:
+                    if gpu["index"] == int(index) or gpu["index"] not in own_indices:
+                        measured[gpu["index"]] = gpu
+            finally:
+                if is_our_worker(record):
+                    try:
+                        os.kill(record["pid"], signal.SIGCONT)
+                    except ProcessLookupError:
+                        pass
+    return sorted(measured.values(), key=lambda gpu: gpu["index"]), apps
+
+
+class Monitor:
+    def __init__(self, config):
+        self.config = config
+        self.workers = {}
+        self.children = {}
+        self.idle_since = {}
+        self.position = 0
+        self.next_rotation = None
+        self.retry_after = {}
+        self.stopping = threading.Event()
+        self.mode = None
+        self.reason = None
+        self.gpu_snapshot = []
+        self.last_success = None
+        self.busy_gpus = {}
+
+    def save_workers(self):
+        atomic_json(STATE / "workers.json", self.workers)
+
+    def report(self, mode, reason):
+        if (mode, reason) != (self.mode, self.reason):
+            LOG.info("%s: %s", mode, reason)
+        self.mode, self.reason = mode, reason
+        atomic_json(STATE / "status.json", {
+            "pid": os.getpid(), "updated": time.time(), "mode": mode, "reason": reason,
+            "last_successful_probe": self.last_success,
+            "workers": self.workers, "gpus": self.gpu_snapshot, "config": self.config,
+            "busy_gpus": self.busy_gpus,
+        })
+
+    def stop_gpus(self, gpu_ids):
+        if not gpu_ids:
+            return
+        terminate_workers([self.workers[gpu] for gpu in gpu_ids])
+        for gpu in gpu_ids:
+            child = self.children.pop(gpu, None)
+            if child is not None:
+                try:
+                    child.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    LOG.error("GPU %s 工作进程尚未响应终止信号", gpu)
+            self.workers.pop(gpu, None)
+            (STATE / f"heartbeat-{gpu}.json").unlink(missing_ok=True)
+            LOG.info("已释放 GPU %s", gpu)
+        self.save_workers()
+
+    def reap_workers(self, now):
+        for gpu, record in list(self.workers.items()):
+            child = self.children[gpu]
+            heartbeat = read_json(STATE / f"heartbeat-{gpu}.json", {})
+            last_beat = heartbeat.get("monotonic", record["started_monotonic"])
+            if heartbeat.get("pid") != record["pid"]:
+                last_beat = record["started_monotonic"]
+            if child.poll() is not None or now - last_beat > self.config["heartbeat_timeout"]:
+                LOG.warning("GPU %s 工作进程退出或计算心跳超时，准备自动恢复", gpu)
+                self.stop_gpus([gpu])
+                self.retry_after[gpu] = now + self.config["interval"]
+
+    def start_gpu(self, gpu, now):
+        index = str(gpu["index"])
+        heartbeat = STATE / f"heartbeat-{index}.json"
+        heartbeat.unlink(missing_ok=True)
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu["uuid"], XIANCUN_ROLE="worker",
+                   XIANCUN_STATE_DIR=str(STATE), XIANCUN_PHYSICAL_GPU=index)
+        child = subprocess.Popen(
+            [self.config["python"], "-u", str(SELF), "__worker", str(self.config["memory_gib"]),
+             str(heartbeat), str(os.getpid())], env=env, stdin=subprocess.DEVNULL,
+        )
+        self.children[index] = child
+        self.workers[index] = {
+            "pid": child.pid, "identity": process_identity(child.pid),
+            "uuid": gpu["uuid"], "started": time.time(), "started_monotonic": now,
+        }
+        self.save_workers()
+        LOG.info("启动 GPU %s 计算进程 PID=%s，每卡 %.2f GiB", index, child.pid, self.config["memory_gib"])
+
+    def step(self):
+        now = time.monotonic()
+        self.reap_workers(now)
+        pause_until = read_json(STATE / "control.json", {}).get("pause_until", 0)
+        if pause_until > time.time():
+            self.stop_gpus(list(self.workers))
+            self.idle_since.clear()
+            self.report("paused", "手动暂停至 " + time.strftime("%F %T %Z", time.localtime(pause_until)))
+            return
+        try:
+            gpus, apps = snapshot()
+            try:
+                reasons = gpu_busy_reasons(gpus, apps, self.workers, self.config["util_threshold"])
+            except UnclearUtilization:
+                LOG.info("逐进程利用率不可用，逐卡暂停自己的计算 2 秒以测量外部实际负载，其余卡继续计算")
+                gpus, apps = unmasked_snapshot(self.workers)
+                reasons = gpu_busy_reasons(gpus, apps, {}, self.config["util_threshold"])
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            # 采样失败不退出，也不把失败当空闲；已有工作进程保持运行。
+            self.idle_since.clear()
+            self.report("probe_error", f"GPU 采样失败，下轮重试：{error}")
+            return
+        self.gpu_snapshot = gpus
+        self.last_success = time.time()
+        self.busy_gpus = reasons
+        self.stop_gpus([gpu for gpu in self.workers if int(gpu) in reasons])
+        for gpu in gpus:
+            index = gpu["index"]
+            if index in reasons:
+                self.idle_since.pop(index, None)
+            else:
+                self.idle_since.setdefault(index, now)
+
+        count = min(self.config["gpu_count"], len(gpus))
+        if self.next_rotation is None:
+            self.next_rotation = now + self.config["rotation_hours"] * 3600
+        elif now >= self.next_rotation:
+            self.position = (self.position + 1) % len(gpus)
+            self.next_rotation = now + self.config["rotation_hours"] * 3600
+            LOG.info("轮换计算 GPU")
+        order = gpus[self.position:] + gpus[:self.position]
+        required_mib = math.ceil(self.config["memory_gib"] * 1024) + 1024
+        idle = [g for g in order if g["index"] not in reasons]
+        confirmed = [g for g in idle if str(g["index"]) in self.workers
+                     or now - self.idle_since[g["index"]] >= self.config["idle_seconds"]]
+        available = [g for g in confirmed if str(g["index"]) in self.workers or g["free"] >= required_mib]
+        desired = available[:count]
+        desired_ids = {str(g["index"]) for g in desired}
+        self.stop_gpus([gpu for gpu in self.workers if gpu not in desired_ids])
+        for gpu in desired:
+            index = str(gpu["index"])
+            if index not in self.workers and now >= self.retry_after.get(index, 0):
+                self.start_gpu(gpu, now)
+        ready = []
+        for gpu, record in self.workers.items():
+            heartbeat = read_json(STATE / f"heartbeat-{gpu}.json", {})
+            if heartbeat.get("pid") == record["pid"] and now - heartbeat.get("monotonic", 0) <= self.config["heartbeat_timeout"]:
+                ready.append(gpu)
+        if ready:
+            self.report("computing", "持续计算 GPU=" + ",".join(ready))
+        elif self.workers:
+            self.report("starting", "工作进程初始化中，等待首个计算心跳")
+        elif not idle:
+            self.report("waiting_training", "; ".join(reasons.values()))
+        elif not confirmed:
+            self.report("confirming_idle", f"逐卡确认空闲中，连续 {self.config['idle_seconds']:g} 秒外部 GPU 利用率不高于 {self.config['util_threshold']}% 后启动；驻留进程不阻止计算")
+        else:
+            self.report("retrying", "等待足够空闲显存或工作进程重试；监测保持运行")
+
+    def run(self):
+        signal.signal(signal.SIGTERM, lambda *_: self.stopping.set())
+        signal.signal(signal.SIGINT, lambda *_: self.stopping.set())
+        terminate_workers(list(read_json(STATE / "workers.json", {}).values()))
+        self.save_workers()
+        LOG.info("监测已启动：每 %g 秒采样，空闲确认 %g 秒，目标 %s 张 GPU",
+                 self.config["interval"], self.config["idle_seconds"], self.config["gpu_count"])
+        try:
+            while not self.stopping.is_set():
+                started = time.monotonic()
+                try:
+                    self.step()
+                except Exception:
+                    LOG.exception("本轮调度异常，下轮自动重试")
+                    self.idle_since.clear()
+                    self.report("error", "调度异常，详见 monitor.log；监测保持运行")
+                self.stopping.wait(max(1, self.config["interval"] - (time.monotonic() - started)))
+        finally:
+            self.stop_gpus(list(self.workers))
+            self.report("stopped", "监测已停止")
+
+
+def worker(memory_gib, heartbeat_path, parent_pid):
+    # 调度器被强杀时也释放 GPU。导入 torch 前设置，避免初始化期间留下孤儿进程。
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "PR_SET_PDEATHSIG failed")
+    if os.getppid() != parent_pid:
+        return
+    import torch
+    running = True
+
+    def stop(*_):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    torch.set_num_threads(1)
+    torch.cuda.set_device(0)
+    size = 4096
+    a = torch.randn((size, size), dtype=torch.float16, device="cuda:0")
+    b = torch.randn_like(a)
+    c = torch.empty_like(a)
+    reserve_bytes = int(memory_gib * 1073741824) - torch.cuda.memory_allocated()
+    reserved = torch.empty(max(0, reserve_bytes), dtype=torch.uint8, device="cuda:0")
+    reserved.fill_(1)
+    torch.cuda.synchronize()
+    last_beat = 0
+    while running:
+        torch.mm(a, b, out=c)
+        torch.cuda.synchronize()
+        now = time.monotonic()
+        if now - last_beat >= 10:
+            atomic_json(heartbeat_path, {"pid": os.getpid(), "updated": time.time(), "monotonic": now})
+            if not last_beat:
+                print(f"GPU {os.environ.get('XIANCUN_PHYSICAL_GPU')} 已开始不间断计算，"
+                      f"allocated={torch.cuda.memory_allocated() / 1073741824:.2f} GiB", flush=True)
+            last_beat = now
+
+
+def write_supervisor_config():
+    # 独立实例，不重启机器上 Jupyter/SSH 使用的 supervisord。
+    path = STATE / "supervisord.conf"
+    path.write_text(f"""[unix_http_server]
+file={STATE}/control.sock
+chmod=0700
+[supervisord]
+logfile={STATE}/service.log
+logfile_maxbytes=5MB
+logfile_backups=2
+pidfile={STATE}/service.pid
+childlogdir={STATE}
+minfds=128
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory=supervisor.rpcinterface:make_main_rpcinterface
+[supervisorctl]
+serverurl=unix://{STATE}/control.sock
+[program:xiancun]
+command=/usr/bin/python3 {SELF} __monitor
+environment=XIANCUN_STATE_DIR="{STATE}"
+autostart=true
+autorestart=true
+startsecs=0
+startretries=999
+stopwaitsecs=15
+stopasgroup=true
+killasgroup=true
+redirect_stderr=true
+stdout_logfile={STATE}/compute.log
+stdout_logfile_maxbytes=5MB
+stdout_logfile_backups=2
+""")
+    return path
+
+
+def supervisorctl(*args):
+    return subprocess.run([SUPERVISORCTL, "-c", str(STATE / "supervisord.conf"), *args],
+                          text=True, capture_output=True, timeout=25)
+
+
+def ensure_service():
+    if not (STATE / "enabled").exists():
+        return
+    path = STATE / "supervisord.conf"
+    if path.exists():
+        result = supervisorctl("status", "xiancun")
+        if "RUNNING" in result.stdout or "STARTING" in result.stdout:
+            return
+        if any(s in result.stdout for s in ("STOPPED", "EXITED", "FATAL")):
+            result = supervisorctl("start", "xiancun")
+            if result.returncode:
+                raise RuntimeError(result.stdout + result.stderr)
+            return
+    path = write_supervisor_config()
+    subprocess.run([SUPERVISORD, "-c", str(path)], check=True, timeout=15,
+                   stdout=subprocess.DEVNULL)
+
+
+def config_from_args(args):
+    config = dict(DEFAULTS, **read_json(STATE / "config.json", {}))
+    for key in DEFAULTS:
+        value = getattr(args, key, None)
+        if value is not None:
+            config[key] = value
+    if os.environ.get("XIANCUN_PYTHON"):
+        config["python"] = os.environ["XIANCUN_PYTHON"]
+    for key in ("memory_gib", "rotation_hours", "interval", "idle_seconds", "heartbeat_timeout"):
+        value = config[key]
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{key} 必须为正数")
+    if config["memory_gib"] < 0.125 or config["gpu_count"] < 1:
+        raise ValueError("显存至少 0.125 GiB，GPU 数至少 1")
+    if config["interval"] > 60 or config["idle_seconds"] > 300:
+        raise ValueError("检测间隔最多 60 秒，空闲确认最多 300 秒")
+    if not os.access(config["python"], os.X_OK):
+        raise ValueError("找不到工作进程 Python：" + config["python"])
+    return config
+
+
+def show_status():
+    enabled = (STATE / "enabled").exists()
+    print("自动监测：" + ("已启用" if enabled else "已禁用"))
+    if (STATE / "supervisord.conf").exists():
+        result = supervisorctl("status", "xiancun")
+        print((result.stdout + result.stderr).strip())
+    config = read_json(STATE / "config.json", DEFAULTS)
+    print(f"每 {config['interval']:g} 秒检测；连续空闲 {config['idle_seconds']:g} 秒后计算；"
+          f"目标 {config['gpu_count']} 卡 × {config['memory_gib']:g} GiB；"
+          f"每 {config['rotation_hours']:g} 小时轮换")
+    print(f"空闲依据：外部 GPU 利用率 ≤ {config['util_threshold']}%；驻留 CUDA 进程不阻止计算")
+    state = read_json(STATE / "status.json", {})
+    if state:
+        age = time.time() - state["updated"]
+        print(f"最近状态：{state['mode']} — {state['reason']}（{age:.0f} 秒前）")
+        if age > max(90, config["interval"] * 3):
+            print("注意：监测状态已过期，请执行 xiancun start 并查看 xiancun log")
+        if state.get("busy_gpus"):
+            print("已让出的 GPU：" + "; ".join(state["busy_gpus"].values()))
+        for gpu, record in state.get("workers", {}).items():
+            heartbeat = read_json(STATE / f"heartbeat-{gpu}.json", {})
+            valid = heartbeat.get("pid") == record["pid"]
+            age = time.monotonic() - heartbeat.get("monotonic", 0)
+            alive = is_our_worker(record)
+            detail = f"最近计算心跳 {age:.0f} 秒前" if valid else "等待计算心跳"
+            print(f"GPU {gpu}：PID={record['pid']}，{'存活' if alive else '已退出'}，{detail}")
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "__worker":
+        worker(float(sys.argv[2]), Path(sys.argv[3]), int(sys.argv[4]))
+        return
+    STATE.mkdir(parents=True, exist_ok=True)
+    if len(sys.argv) > 1 and sys.argv[1] == "__monitor":
+        handler = RotatingFileHandler(STATE / "monitor.log", maxBytes=5 * 1024 * 1024, backupCount=2)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        LOG.addHandler(handler)
+        LOG.setLevel(logging.INFO)
+        with lock("monitor.lock", blocking=False):
+            Monitor(dict(DEFAULTS, **read_json(STATE / "config.json", {}))).run()
+        return
+    parser = argparse.ArgumentParser(description="按 GPU 实际利用率判断空闲；驻留 CUDA 进程不阻止计算。")
+    commands = parser.add_subparsers(dest="command", required=True)
+    start = commands.add_parser("start", help="启用自动监测及自启动（可重复执行）")
+    start.add_argument("memory_gib", nargs="?", type=float)
+    start.add_argument("rotation_hours", nargs="?", type=float)
+    start.add_argument("--interval", type=float)
+    start.add_argument("--idle-seconds", type=float)
+    start.add_argument("--gpu-count", type=int)
+    commands.add_parser("ensure", help="自启动入口，仅在已启用时恢复服务")
+    commands.add_parser("status", help="显示监测和真实计算心跳")
+    commands.add_parser("log", help="查看监测、工作进程及服务日志")
+    pause = commands.add_parser("pause", help="暂时释放 GPU，指定分钟数后自动恢复监测")
+    pause.add_argument("minutes", nargs="?", default=10.0, type=float)
+    commands.add_parser("stop", help="彻底禁用自动监测及自启动（训练前请用 pause）")
+    args = parser.parse_args()
+    if args.command == "status":
+        show_status()
+        return
+    if args.command == "log":
+        for name in ("monitor.log", "compute.log", "service.log"):
+            print(f"== {name} ==")
+            try:
+                print("".join((STATE / name).read_text(errors="replace").splitlines(True)[-30:]), end="")
+            except FileNotFoundError:
+                pass
+        return
+    with lock("control.lock"):
+        if args.command == "start":
+            config = config_from_args(args)
+            changed = config != read_json(STATE / "config.json", {})
+            atomic_json(STATE / "config.json", config)
+            atomic_json(STATE / "control.json", {"pause_until": 0})
+            (STATE / "enabled").touch()
+            if changed and (STATE / "supervisord.conf").exists():
+                supervisorctl("stop", "xiancun")
+            ensure_service()
+            print("已启用自动监测；默认外部 GPU 利用率归零后约 30–60 秒启动计算进程，无需退出驻留进程。")
+        elif args.command == "ensure":
+            ensure_service()
+        elif args.command == "pause":
+            if not math.isfinite(args.minutes) or args.minutes <= 0:
+                raise ValueError("暂停分钟数必须为正数")
+            if not (STATE / "enabled").exists():
+                raise ValueError("自动监测未启用，请先执行 xiancun start")
+            atomic_json(STATE / "control.json", {"pause_until": time.time() + args.minutes * 60})
+            supervisorctl("stop", "xiancun")
+            ensure_service()
+            print(f"已释放 GPU，暂停 {args.minutes:g} 分钟后自动继续监测。")
+        elif args.command == "stop":
+            (STATE / "enabled").unlink(missing_ok=True)
+            if (STATE / "supervisord.conf").exists():
+                result = supervisorctl("stop", "xiancun")
+                print((result.stdout + result.stderr).strip())
+            terminate_workers(list(read_json(STATE / "workers.json", {}).values()))
+            print("已彻底停止并禁用自启动；重新启用请执行 xiancun start。")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f"xiancun: {error}", file=sys.stderr)
+        sys.exit(1)
