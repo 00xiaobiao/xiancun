@@ -1,8 +1,13 @@
 import argparse
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 from pathlib import Path
 import tempfile
+import os
+import sys
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -30,7 +35,7 @@ class MonitorTests(unittest.TestCase):
         self.addCleanup(self.terminate.stop)
         self.gpus = [{"index": i, "uuid": f"GPU-{i}", "util": 0, "free": 32000} for i in range(3)]
         self.snapshot.return_value = (self.gpus, [])
-        self.monitor = xi.Monitor(dict(xi.DEFAULTS))
+        self.monitor = xi.Monitor(dict(xi.DEFAULTS, gpu_count=2, memory_gib=5.0))
         self.pid = 90000
         self.monitor.start_gpu = Mock(side_effect=self.fake_start)
 
@@ -263,6 +268,122 @@ class MonitorTests(unittest.TestCase):
         for args in (argparse.Namespace(interval=601), argparse.Namespace(memory_gib=float("nan"))):
             with self.assertRaises(ValueError):
                 xi.config_from_args(args)
+
+    def test_missing_stored_python_is_replaced_automatically(self):
+        xi.atomic_json(xi.STATE / "config.json", {"python": "/does/not/exist"})
+        with patch.object(xi, "python_supports_torch", return_value=True):
+            config = xi.config_from_args(argparse.Namespace())
+        self.assertEqual(config["python"], xi.sys.executable)
+
+    def test_missing_supervisor_uses_builtin_backend(self):
+        (xi.STATE / "enabled").touch()
+        with patch.object(xi, "supervisor_available", return_value=False), \
+                patch.object(xi, "start_local_monitor") as start:
+            self.assertEqual(xi.ensure_service(), "builtin")
+        self.assertEqual((xi.STATE / "backend").read_text().strip(), "builtin")
+        start.assert_called_once_with()
+
+
+class PortabilityTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        state = patch.object(xi, "STATE", Path(directory.name))
+        state.start()
+        self.addCleanup(state.stop)
+        env = patch.dict(os.environ, {"XIANCUN_BACKEND": "auto"})
+        env.start()
+        self.addCleanup(env.stop)
+        for key in ("XIANCUN_PYTHON", "CUDA_VISIBLE_DEVICES", "XIANCUN_TORCH_INDEX_URL"):
+            os.environ.pop(key, None)
+
+    def test_isolated_devices_diagnosis_does_not_claim_driver_is_broken(self):
+        with patch.object(Path, "glob", return_value=[]), patch.object(Path, "exists", return_value=True):
+            result = xi.gpu_diagnosis(RuntimeError("driver query failed"))
+        self.assertIn("沙箱隔离", result)
+        self.assertIn("--gpus all", result)
+        self.assertIn("不是需要重装驱动", result)
+
+    def test_gpu_failure_aborts_start_before_install_or_enabling(self):
+        with patch.object(sys, "argv", [str(xi.SELF), "start"]), \
+                patch.object(xi, "snapshot", side_effect=RuntimeError("no GPU")), \
+                patch.object(xi, "install_runtime") as install:
+            with self.assertRaises(RuntimeError):
+                xi.main()
+        install.assert_not_called()
+        self.assertFalse((xi.STATE / "enabled").exists())
+
+    def test_cpu_only_python_is_rejected(self):
+        # This exercises the actual subprocess probe with a CPU-only torch
+        # stand-in; a successful import must not count as CUDA readiness.
+        (xi.STATE / "torch.py").write_text("class cuda:\n @staticmethod\n def is_available(): return False\n")
+        with patch.dict(os.environ, {"PYTHONPATH": str(xi.STATE)}):
+            self.assertFalse(xi.python_supports_torch(sys.executable))
+
+    def test_no_install_fails_without_downloading(self):
+        with patch.object(xi, "python_supports_torch", return_value=False), \
+                patch.object(xi, "install_runtime") as install:
+            with self.assertRaises(ValueError):
+                xi.config_from_args(argparse.Namespace(no_install=True))
+        install.assert_not_called()
+
+    def test_missing_torch_bootstraps_private_runtime(self):
+        with patch.object(xi, "python_supports_torch", return_value=False), \
+                patch.object(xi, "install_runtime", return_value="/private/runtime/bin/python") as install:
+            config = xi.config_from_args(argparse.Namespace())
+        self.assertEqual(config["python"], "/private/runtime/bin/python")
+        install.assert_called_once_with()
+
+    def test_dependency_install_targets_private_venv(self):
+        with patch.object(xi, "smi_rows", return_value=[["580.159.04"]]), \
+                patch.object(xi.venv, "EnvBuilder") as builder, \
+                patch.object(xi.subprocess, "run") as run, \
+                patch.object(xi, "python_supports_torch", return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            python = xi.install_runtime()
+        self.assertEqual(python, str(xi.STATE / "runtime/bin/python"))
+        builder.return_value.create.assert_called_once_with(xi.STATE / "runtime")
+        self.assertEqual(run.call_args.args[0][0], python)
+        self.assertIn("https://download.pytorch.org/whl/cu128", run.call_args.args[0])
+
+    def test_snapshot_respects_cuda_visible_devices(self):
+        rows = [["0", "GPU-zero", "0", "32000"], ["1", "GPU-one", "0", "32000"]]
+        for mask in ("1", "GPU-one"):
+            with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": mask}), \
+                    patch.object(xi, "smi_rows", side_effect=[rows, []]):
+                gpus, _ = xi.snapshot()
+            self.assertEqual([g["index"] for g in gpus], [1])
+
+    def test_missing_identity_never_matches_dead_pid(self):
+        xi.atomic_json(xi.STATE / "monitor.pid", {"pid": 987654321, "identity": None})
+        with patch.object(xi, "process_identity", return_value=None):
+            self.assertIsNone(xi.monitor_record())
+
+    @unittest.skipUnless(xi.process_identity(os.getpid()), "需要同一 PID 命名空间下可读的 /proc")
+    def test_background_start_idempotency_and_stop_without_supervisor(self):
+        # A busy GPU fixture avoids GPU/PyTorch use while running the actual
+        # detached monitor and single-instance handshake across processes.
+        smi = xi.STATE / "fake-smi"
+        smi.write_text("#!/bin/sh\ncase \"$1\" in\n--query-gpu=*) echo '0, GPU-test, 100, 32000';;\nesac\n")
+        smi.chmod(0o755)
+        xi.atomic_json(xi.STATE / "config.json", dict(xi.DEFAULTS, interval=1, idle_seconds=1))
+        (xi.STATE / "enabled").touch()
+        with patch.dict(os.environ, {"XIANCUN_NVIDIA_SMI": str(smi), "XIANCUN_BACKEND": "builtin"}):
+            try:
+                xi.ensure_service()
+                first = xi.monitor_record()
+                self.assertIsNotNone(first)
+                xi.ensure_service()
+                self.assertEqual(xi.monitor_record()["pid"], first["pid"])
+                deadline = time.monotonic() + 5
+                while not (xi.STATE / "status.json").exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertEqual(xi.read_json(xi.STATE / "status.json")["mode"], "waiting_training")
+            finally:
+                xi.stop_service()
+                (xi.STATE / "enabled").unlink(missing_ok=True)
+        self.assertIsNone(xi.monitor_record())
+        self.assertEqual(xi.read_json(xi.STATE / "status.json")["mode"], "stopped")
 
 
 if __name__ == "__main__":

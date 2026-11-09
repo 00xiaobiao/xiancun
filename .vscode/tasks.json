@@ -1,0 +1,30 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "xiancun: 运行 GPU 保活",
+      "type": "process",
+      "command": "${workspaceFolder}/xiancun",
+      "args": ["run", "1", "24", "--gpu-count", "1"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "isBackground": true
+    },
+    {
+      "label": "xiancun: 查看状态",
+      "type": "process",
+      "command": "${workspaceFolder}/xiancun",
+      "args": ["status"],
+      "problemMatcher": []
+    },
+    {
+      "label": "xiancun: 查看日志",
+      "type": "process",
+      "command": "${workspaceFolder}/xiancun",
+      "args": ["log"],
+      "problemMatcher": []
+    }
+  ]
+}
